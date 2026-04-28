@@ -1,0 +1,8 @@
+{
+  "name": "Misty Guitar Coach",
+  "description": "An interactive guitar learning app for mastering the jazz standard 'Misty', featuring chord diagrams, rhythm guides, and practice tools.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "AI_CHORD_ANALYSIS"
+  ]
+}
