@@ -16,13 +16,16 @@ import {
   ChevronLeft,
   Volume2
 } from "lucide-react";
+import * as Tone from "tone";
 import { ChordDiagram } from "./components/ChordDiagram";
+import { GuitarNeck } from "./components/GuitarNeck";
 import { MISTY_CHORDS, MISTY_SONG, CHORD_VARIATIONS } from "./constants";
 import { ChordData } from "./types";
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<"practice" | "library" | "tips">("practice");
   const [isPlaying, setIsPlaying] = useState(false);
+  const [isAudioReady, setIsAudioReady] = useState(false);
   const [tempo, setTempo] = useState(72);
   const [currentBeat, setCurrentBeat] = useState(0);
   const [currentMeasure, setCurrentMeasure] = useState(0);
@@ -32,6 +35,41 @@ export default function App() {
   const timerRef = useRef<NodeJS.Timeout | null>(null);
   const lastBeatStartTime = useRef<number>(Date.now());
   const feedbackTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const synthRef = useRef<Tone.PolySynth | null>(null);
+
+  // Initialize synth
+  useEffect(() => {
+    const synth = new Tone.PolySynth(Tone.Synth, {
+      oscillator: { type: "sawtooth8" },
+      envelope: { attack: 0.1, decay: 0.3, sustain: 0.2, release: 1 },
+    }).toDestination();
+    synth.volume.value = -12;
+    synthRef.current = synth;
+  }, []);
+
+  const initAudio = async () => {
+    await Tone.start();
+    setIsAudioReady(true);
+  };
+
+  // Convert fretboard data to MIDI notes
+  const playChordAudio = (chord: ChordData) => {
+    if (!synthRef.current || !isAudioReady) return;
+    
+    const standardTuning = ["E2", "A2", "D3", "G3", "B3", "E4"];
+    const notesToPlay: string[] = [];
+    chord.frets.forEach((fret, i) => {
+      if (fret !== "x") {
+        const note = Tone.Frequency(standardTuning[5 - i]).transpose(Number(fret)).toNote();
+        notesToPlay.push(note as any);
+      }
+    });
+
+    // Strum effect: staggered start
+    notesToPlay.forEach((note, i) => {
+      synthRef.current?.triggerAttackRelease(note, "2n", Tone.now() + i * 0.05);
+    });
+  };
 
   // Pre-calculate section boundaries for faster lookups
   const sections = React.useMemo(() => {
@@ -75,6 +113,7 @@ export default function App() {
 
   useEffect(() => {
     if (isPlaying) {
+      if (!isAudioReady) initAudio();
       const msPerBeat = (60 / tempo) * 1000;
       timerRef.current = setInterval(handleTick, msPerBeat);
     } else {
@@ -83,7 +122,7 @@ export default function App() {
     return () => {
       if (timerRef.current) clearInterval(timerRef.current);
     };
-  }, [isPlaying, tempo, handleTick]);
+  }, [isPlaying, tempo, handleTick, isAudioReady]);
 
   const currentMeasureData = allMeasures[currentMeasure];
   // Determine which chord is active based on currentBeat
@@ -98,14 +137,16 @@ export default function App() {
   }
 
   const handleTap = () => {
-    if (!isPlaying) return;
+    if (!isPlaying) {
+      if (!isAudioReady) initAudio();
+      setIsPlaying(true);
+      return;
+    }
     
     const now = Date.now();
     const msPerBeat = (60 / tempo) * 1000;
     const timeSinceBeatStart = now - lastBeatStartTime.current;
     
-    // We want the tap to be close to 0 or msPerBeat (beginning or end of the current visual beat)
-    // Actually, it's easier to check distance to "now" vs "expected next beat"
     const offset = Math.min(timeSinceBeatStart, Math.abs(msPerBeat - timeSinceBeatStart));
     const accuracy = offset / msPerBeat;
 
@@ -118,9 +159,29 @@ export default function App() {
     setTapFeedback(feedback);
     if (feedbackTimeoutRef.current) clearTimeout(feedbackTimeoutRef.current);
     feedbackTimeoutRef.current = setTimeout(() => setTapFeedback(null), 600);
+    
+    // Strum on tap
+    if (activeChord) playChordAudio(activeChord);
   };
 
   const activeChord = MISTY_CHORDS[activeChordName];
+
+  // Play audio when chord changes on tick 0 or when measure changes
+  useEffect(() => {
+    if (isPlaying && activeChord) {
+      // Find out if current beat is the start of a chord in the current measure
+      let currentAccum = 0;
+      const isStartOfChord = currentMeasureData.chords.some(c => {
+        const match = currentAccum === currentBeat;
+        currentAccum += c.beats;
+        return match;
+      });
+
+      if (isStartOfChord) {
+        playChordAudio(activeChord);
+      }
+    }
+  }, [currentBeat, currentMeasure, isPlaying, activeChord]);
 
   return (
     <div className="min-h-screen bg-stone-50 text-stone-900 font-sans selection:bg-amber-200">
@@ -160,138 +221,153 @@ export default function App() {
 
       <main className="max-w-6xl mx-auto p-6 md:p-10">
         {activeTab === "practice" && (
-          <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
-            {/* Left Panel: Chord Focus */}
-            <div className="lg:col-span-1 border-r border-stone-200 lg:pr-8">
-              <div className="sticky top-28">
-                <div className="mb-6">
-                  <h2 className="text-sm font-bold uppercase tracking-widest text-stone-400 mb-2">Current Chord</h2>
-                  <AnimatePresence mode="wait">
-                    <motion.div
-                      key={activeChordName}
-                      initial={{ opacity: 0, y: 10 }}
-                      animate={{ opacity: 1, y: 0 }}
-                      exit={{ opacity: 0, y: -10 }}
-                      className="flex justify-center"
-                    >
-                      {activeChord ? (
-                        <ChordDiagram chord={activeChord} size={240} />
-                      ) : (
-                        <div className="text-stone-400 italic">Chord not defined</div>
-                      )}
-                    </motion.div>
-                  </AnimatePresence>
+          <div className="flex flex-col gap-8">
+            {/* Top Section: Simulation Fretboard */}
+            <div className="w-full">
+              <div className="mb-6 flex items-center justify-between px-2">
+                <div>
+                  <h2 className="text-sm font-bold uppercase tracking-widest text-stone-400 mb-1">Fretboard Simulation</h2>
+                  <div className="flex items-center gap-2">
+                    <span className="text-3xl font-black text-amber-900">{activeChordName}</span>
+                    <span className="text-stone-400 font-mono text-sm">Bar {currentMeasure + 1} • Beat {currentBeat + 1}</span>
+                  </div>
                 </div>
+                {!isAudioReady && (
+                  <button 
+                    onClick={initAudio}
+                    className="flex items-center gap-2 bg-amber-100 text-amber-700 px-4 py-2 rounded-lg font-bold hover:bg-amber-200 transition-colors"
+                  >
+                    <Volume2 size={18} />
+                    Enable Audio
+                  </button>
+                )}
+              </div>
+              
+              <GuitarNeck chord={activeChord} />
+            </div>
 
-                <div className="bg-white p-6 rounded-2xl shadow-sm border border-stone-200">
-                  <h3 className="font-bold flex items-center gap-2 mb-4">
-                    <Volume2 size={18} className="text-amber-600" />
-                    Metronome
-                  </h3>
-                  <div className="flex items-center justify-between gap-4 mb-6">
-                    <button 
-                      onClick={() => setTempo(t => Math.max(40, t - 4))}
-                      className="p-2 rounded-full bg-stone-100 hover:bg-stone-200"
-                    >
-                      <ChevronLeft size={20} />
-                    </button>
-                    <div className="text-center">
-                      <div className="text-3xl font-black text-stone-900 leading-none">{tempo}</div>
-                      <div className="text-[10px] uppercase tracking-tighter text-stone-400 font-bold">BPM</div>
+            <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
+              {/* Left Panel: Rhythm & Controls */}
+              <div className="lg:col-span-1 border-r border-stone-200 lg:pr-8">
+                <div className="space-y-6 sticky top-28">
+                  <div className="bg-white p-6 rounded-2xl shadow-sm border border-stone-200">
+                    <div className="flex items-center justify-between mb-4">
+                      <h3 className="font-bold flex items-center gap-2">
+                        <Volume2 size={18} className="text-amber-600" />
+                        Metronome
+                      </h3>
+                      {!isPlaying && (
+                        <div className="text-[10px] font-bold text-amber-600 bg-amber-50 px-2 py-0.5 rounded uppercase">Paused</div>
+                      )}
                     </div>
-                    <button 
-                      onClick={() => setTempo(t => Math.min(200, t + 4))}
-                      className="p-2 rounded-full bg-stone-100 hover:bg-stone-200"
-                    >
-                      <ChevronRight size={20} />
-                    </button>
-                  </div>
-                  
-                  <div className="flex gap-2 justify-center mb-6">
-                    {[0, 1, 2, 3].map(i => (
-                      <div 
-                        key={i}
-                        className={`h-2 w-full rounded-full transition-all duration-100 ${
-                          i === currentBeat 
-                            ? i === 0 ? "bg-amber-500 scale-y-125 shadow-lg shadow-amber-200" : "bg-stone-800 scale-y-110" 
-                            : "bg-stone-200"
+                    
+                    <div className="flex items-center justify-between gap-4 mb-6">
+                      <button 
+                        onClick={() => setTempo(t => Math.max(40, t - 4))}
+                        className="p-2 rounded-full bg-stone-100 hover:bg-stone-200"
+                      >
+                        <ChevronLeft size={20} />
+                      </button>
+                      <div className="text-center">
+                        <div className="text-3xl font-black text-stone-900 leading-none">{tempo}</div>
+                        <div className="text-[10px] uppercase tracking-tighter text-stone-400 font-bold">BPM</div>
+                      </div>
+                      <button 
+                        onClick={() => setTempo(t => Math.min(200, t + 4))}
+                        className="p-2 rounded-full bg-stone-100 hover:bg-stone-200"
+                      >
+                        <ChevronRight size={20} />
+                      </button>
+                    </div>
+                    
+                    <div className="flex gap-2 justify-center mb-6">
+                      {[0, 1, 2, 3].map(i => (
+                        <div 
+                          key={i}
+                          className={`h-2 w-full rounded-full transition-all duration-100 ${
+                            i === currentBeat 
+                              ? i === 0 ? "bg-amber-500 scale-y-125 shadow-lg shadow-amber-200" : "bg-stone-800 scale-y-110" 
+                              : "bg-stone-200"
+                          }`}
+                        />
+                      ))}
+                    </div>
+
+                    <div className="flex gap-3">
+                      <button
+                        onClick={() => {
+                          if (!isAudioReady) initAudio();
+                          setIsPlaying(!isPlaying);
+                        }}
+                        className={`flex-1 flex items-center justify-center gap-2 py-3 rounded-xl font-bold transition-all ${
+                          isPlaying 
+                            ? "bg-stone-100 text-stone-900 border-2 border-stone-200" 
+                            : "bg-amber-600 text-white shadow-xl shadow-amber-200 hover:bg-amber-700"
                         }`}
-                      />
-                    ))}
+                      >
+                        {isPlaying ? <Pause size={20} fill="currentColor" /> : <Play size={20} fill="currentColor" />}
+                        {isPlaying ? "Pause" : "Start"}
+                      </button>
+                      <button
+                        onClick={() => {
+                          setIsPlaying(false);
+                          setCurrentBeat(0);
+                          setCurrentMeasure(0);
+                          setTapFeedback(null);
+                        }}
+                        className="p-3 rounded-xl bg-stone-100 text-stone-600 hover:bg-stone-200 transition-colors"
+                      >
+                        <RotateCcw size={20} />
+                      </button>
+                    </div>
                   </div>
 
-                  <div className="flex gap-3">
+                  <div className="bg-white p-6 rounded-2xl shadow-sm border border-stone-200 overflow-hidden relative">
+                    <h3 className="font-bold mb-4 flex items-center justify-between">
+                      <span>Rhythm Pad / Strum Simulation</span>
+                      <AnimatePresence>
+                        {tapFeedback && (
+                          <motion.span
+                            initial={{ opacity: 0, scale: 0.5, y: 10 }}
+                            animate={{ opacity: 1, scale: 1, y: 0 }}
+                            exit={{ opacity: 0, scale: 1.5 }}
+                            className={`text-xs tracking-widest ${tapFeedback.color}`}
+                          >
+                            {tapFeedback.text}
+                          </motion.span>
+                        )}
+                      </AnimatePresence>
+                    </h3>
+                    
                     <button
-                      onClick={() => setIsPlaying(!isPlaying)}
-                      className={`flex-1 flex items-center justify-center gap-2 py-3 rounded-xl font-bold transition-all ${
+                      onMouseDown={handleTap}
+                      className={`w-full aspect-video rounded-xl border-2 border-dashed flex flex-col items-center justify-center gap-2 transition-all active:scale-95 touch-none ${
                         isPlaying 
-                          ? "bg-stone-100 text-stone-900 border-2 border-stone-200" 
-                          : "bg-amber-600 text-white shadow-xl shadow-amber-200 hover:bg-amber-700"
+                          ? "border-amber-300 bg-amber-50/50 hover:bg-amber-50 cursor-pointer" 
+                          : "border-stone-200 bg-stone-50 cursor-not-allowed opacity-50"
                       }`}
                     >
-                      {isPlaying ? <Pause size={20} fill="currentColor" /> : <Play size={20} fill="currentColor" />}
-                      {isPlaying ? "Pause" : "Play"}
+                      <div className="w-12 h-12 rounded-full bg-white shadow-inner flex items-center justify-center">
+                        <div className={`w-8 h-8 rounded-full transition-all duration-75 ${isPlaying ? "bg-amber-500 shadow-lg" : "bg-stone-200"}`} />
+                      </div>
+                      <span className="text-[10px] font-bold text-stone-400 uppercase tracking-widest">Tap to Strum</span>
                     </button>
-                    <button
-                      onClick={() => {
-                        setIsPlaying(false);
-                        setCurrentBeat(0);
-                        setCurrentMeasure(0);
-                        setTapFeedback(null);
-                      }}
-                      className="p-3 rounded-xl bg-stone-100 text-stone-600 hover:bg-stone-200 transition-colors"
-                    >
-                      <RotateCcw size={20} />
-                    </button>
-                  </div>
-                </div>
 
-                <div className="mt-6 bg-white p-6 rounded-2xl shadow-sm border border-stone-200 overflow-hidden relative">
-                  <h3 className="font-bold mb-4 flex items-center justify-between">
-                    <span>Rhythm Pad</span>
-                    <AnimatePresence>
-                      {tapFeedback && (
-                        <motion.span
-                          initial={{ opacity: 0, scale: 0.5, y: 10 }}
-                          animate={{ opacity: 1, scale: 1, y: 0 }}
-                          exit={{ opacity: 0, scale: 1.5 }}
-                          className={`text-xs tracking-widest ${tapFeedback.color}`}
-                        >
-                          {tapFeedback.text}
-                        </motion.span>
-                      )}
-                    </AnimatePresence>
-                  </h3>
-                  
-                  <button
-                    onMouseDown={handleTap}
-                    className={`w-full aspect-video rounded-xl border-2 border-dashed flex flex-col items-center justify-center gap-2 transition-all active:scale-95 touch-none ${
-                      isPlaying 
-                        ? "border-amber-300 bg-amber-50/50 hover:bg-amber-50 cursor-pointer" 
-                        : "border-stone-200 bg-stone-50 cursor-not-allowed opacity-50"
-                    }`}
-                  >
-                    <div className="w-12 h-12 rounded-full bg-white shadow-inner flex items-center justify-center">
-                      <div className={`w-8 h-8 rounded-full transition-all duration-75 ${isPlaying ? "bg-amber-500 shadow-lg" : "bg-stone-200"}`} />
+                    <div className="mt-4 h-1 w-full bg-stone-100 rounded-full overflow-hidden">
+                      <motion.div 
+                        key={currentBeat}
+                        initial={{ width: "0%" }}
+                        animate={{ width: "100%" }}
+                        transition={{ duration: 60/tempo, ease: "linear" }}
+                        className="h-full bg-amber-400"
+                      />
                     </div>
-                    <span className="text-[10px] font-bold text-stone-400 uppercase tracking-widest">Tap rhythm here</span>
-                  </button>
-
-                  <div className="mt-4 h-1 w-full bg-stone-100 rounded-full overflow-hidden">
-                    <motion.div 
-                      key={currentBeat}
-                      initial={{ width: "0%" }}
-                      animate={{ width: "100%" }}
-                      transition={{ duration: 60/tempo, ease: "linear" }}
-                      className="h-full bg-amber-400"
-                    />
                   </div>
                 </div>
               </div>
-            </div>
 
-            {/* Right Panel: Song Structure */}
-            <div className="lg:col-span-2">
+              {/* Right Panel: Song Structure */}
+              <div className="lg:col-span-2">
               <h2 className="text-sm font-bold uppercase tracking-widest text-stone-400 mb-6 px-2">Song Flow</h2>
               
               <div className="space-y-12">
@@ -378,6 +454,7 @@ export default function App() {
                     </section>
                   );
                 })}
+              </div>
               </div>
             </div>
           </div>
